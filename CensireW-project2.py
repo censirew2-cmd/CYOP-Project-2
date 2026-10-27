@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
+import re
+import socket
 import sqlite3
 from datetime import datetime, timezone
+from html.parser import HTMLParser
+from http.client import HTTPException
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from flask import Flask, jsonify, make_response, request  # type: ignore[reportMissingImports]
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -18,6 +25,8 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("PAIR_PRICE_PORT", "8765"))
 DATABASE = Path(__file__).with_name("shoe_tracker.db")
 MAX_REQUEST_SIZE = 16_384
+MAX_PRODUCT_PAGE_SIZE = 2_000_000
+PRODUCT_FETCH_TIMEOUT = 8
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_SIZE
 
@@ -91,6 +100,7 @@ PAGE = r"""<!doctype html>
     .card-actions { display: flex; gap: 8px; }
     .small-btn { flex: 1; height: 36px; border: 1px solid var(--line); border-radius: 9px; background: white; color: var(--ink); font-size: 12px; font-weight: 700; }
     .small-btn:hover { border-color: #b5c3b4; background: #f7f9f5; }
+    .fetch-price { width: 100%; margin-top: 7px; }
     .small-btn.delete { flex: 0 0 38px; color: var(--red); }
     .empty { grid-column: 1 / -1; padding: 55px 20px; border: 1px dashed #c9ccc4; border-radius: 17px; color: var(--muted); text-align: center; }
     .empty strong { display: block; margin-bottom: 7px; color: var(--ink); font-size: 17px; }
@@ -122,14 +132,14 @@ PAGE = r"""<!doctype html>
       <div>
         <p class="eyebrow">Good shoes. Better prices.</p>
         <h1>Keep an eye on<br>your next pair.</h1>
-        <p class="hero-copy">Save the shoes you love and update their prices as they change. Set a target price and know when your recorded price reaches it.</p>
+        <p class="hero-copy">Save the shoes you love, pull prices from product pages, and know when a pair reaches your target.</p>
       </div>
       <div class="summary"><strong id="shoe-count">0</strong><span>pairs on your list</span></div>
     </section>
     <form class="add-panel" id="add-form">
       <div class="field name"><label for="name">SHOE NAME</label><input id="name" name="name" placeholder="e.g. Air Max 90" maxlength="100" required></div>
       <div class="field url"><label for="url">PRODUCT LINK</label><input id="url" name="url" type="url" placeholder="https://store.com/product" maxlength="2000" required></div>
-      <div class="field"><label for="price">CURRENT PRICE ($)</label><input id="price" name="price" type="number" min="0.01" max="1000000" step="0.01" placeholder="120.00" required></div>
+      <div class="field"><label for="price">CURRENT PRICE ($) · OPTIONAL</label><input id="price" name="price" type="number" min="0.01" max="1000000" step="0.01" placeholder="Auto-pull from link"><button class="small-btn fetch-price" id="fetch-price" type="button">Pull price from link</button></div>
       <div class="field"><label for="target">TARGET ($) · OPTIONAL</label><input id="target" name="target" type="number" min="0.01" max="1000000" step="0.01" placeholder="90.00"></div>
       <div class="field"><label for="priority">PRIORITY</label><select id="priority" name="priority"><option value="Low">Low</option><option value="Medium" selected>Medium</option><option value="High">High</option></select></div>
       <button class="primary" type="submit">＋ Add pair</button>
@@ -144,6 +154,7 @@ PAGE = r"""<!doctype html>
     const list = document.querySelector("#shoe-list");
     const count = document.querySelector("#shoe-count");
     const form = document.querySelector("#add-form");
+    const fetchPriceButton = document.querySelector("#fetch-price");
     const search = document.querySelector("#search");
     const notice = document.querySelector("#notice");
     let shoes = [];
@@ -197,7 +208,8 @@ PAGE = r"""<!doctype html>
               <div class="target-price">${shoe.target_price === null ? "No target set" : "TARGET"}${shoe.target_price === null ? "" : `<strong>${money(shoe.target_price)}</strong>`}</div></div>
             <div class="history">${history || "No price history yet."}</div>
             <div class="card-actions">
-              <button class="small-btn" data-action="update" data-id="${shoe.id}">Update price</button>
+              <button class="small-btn" data-action="refresh" data-id="${shoe.id}">Refresh price</button>
+              <button class="small-btn" data-action="edit" data-id="${shoe.id}">Enter price</button>
               <button class="small-btn delete" data-action="delete" data-id="${shoe.id}" aria-label="Remove ${escapeHtml(shoe.name)}" title="Remove pair">×</button>
             </div>
           </div>
@@ -212,24 +224,45 @@ PAGE = r"""<!doctype html>
         showNotice(error.message);
       }
     }
+    fetchPriceButton.addEventListener("click", async () => {
+      const url = form.elements.url.value;
+      if (!url) {
+        showNotice("Enter a product link first.");
+        return;
+      }
+      fetchPriceButton.disabled = true;
+      try {
+        const result = await request("/api/price", {
+          method: "POST",
+          body: JSON.stringify({ url })
+        });
+        form.elements.price.value = result.price.toFixed(2);
+        showNotice(`Found ${money(result.price)} on the product page.`);
+      } catch (error) {
+        showNotice(error.message);
+      } finally {
+        fetchPriceButton.disabled = false;
+      }
+    });
     form.addEventListener("submit", async event => {
       event.preventDefault();
       const values = new FormData(form);
       const target = values.get("target");
+      const price = values.get("price");
       try {
         await request("/api/shoes", {
           method: "POST",
           body: JSON.stringify({
             name: values.get("name"),
             url: values.get("url"),
-            price: Number(values.get("price")),
+            ...(price ? { price: Number(price) } : {}),
             target_price: target ? Number(target) : null,
             priority: values.get("priority")
           })
         });
         form.reset();
         await loadShoes();
-        showNotice("Pair added to your list.");
+        showNotice(price ? "Pair added to your list." : "Price pulled from the website and pair added.");
       } catch (error) {
         showNotice(error.message);
       }
@@ -240,7 +273,18 @@ PAGE = r"""<!doctype html>
       if (!button) return;
       const shoe = shoes.find(item => item.id === Number(button.dataset.id));
       if (!shoe) return;
-      if (button.dataset.action === "update") {
+      if (button.dataset.action === "refresh") {
+        button.disabled = true;
+        try {
+          const updated = await request(`/api/shoes/${shoe.id}/refresh`, { method: "POST" });
+          await loadShoes();
+          showNotice(`Price refreshed to ${money(updated.price)}.`);
+        } catch (error) {
+          showNotice(error.message);
+        } finally {
+          button.disabled = false;
+        }
+      } else if (button.dataset.action === "edit") {
         const value = prompt(`Enter the current price for ${shoe.name}:`, shoe.price.toFixed(2));
         if (value === null) return;
         const price = Number(value);
@@ -364,6 +408,148 @@ def validate_url(value: object) -> str:
     return value.strip()
 
 
+def validate_public_url(value: str) -> str:
+    url = validate_url(value)
+    parsed = urlparse(url)
+    if parsed.username is not None or parsed.password is not None or parsed.hostname is None:
+        raise ValueError("Product links must use a public website address.")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        addresses = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError("The product website address could not be reached.") from exc
+    if not addresses or any(not ipaddress.ip_address(info[4][0]).is_global for info in addresses):
+        raise ValueError("Only publicly accessible product websites can be checked.")
+    return url
+
+
+class ProductPageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta_prices: list[str] = []
+        self.item_prices: list[str] = []
+        self.schema_scripts: list[str] = []
+        self._reading_schema = False
+        self._schema_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attributes: list[tuple[str, str | None]]) -> None:
+        attrs = {key.lower(): value for key, value in attributes if value is not None}
+        if tag.lower() == "meta":
+            key = (attrs.get("property") or attrs.get("name") or attrs.get("itemprop") or "").lower()
+            content = attrs.get("content")
+            if content:
+                if key in {"product:price:amount", "og:price:amount", "price"}:
+                    self.meta_prices.append(content)
+        if attrs.get("itemprop", "").lower() == "price":
+            price_value = attrs.get("content") or attrs.get("value")
+            if price_value:
+                self.item_prices.append(price_value)
+        if tag.lower() == "script" and "ld+json" in attrs.get("type", "").lower():
+            self._reading_schema = True
+            self._schema_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._reading_schema:
+            self._schema_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._reading_schema:
+            self.schema_scripts.append("".join(self._schema_parts))
+            self._reading_schema = False
+
+
+def _validated_page_price(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    match = re.search(r"\d[\d,]*(?:\.\d+)?", str(value))
+    if match is None:
+        return None
+    try:
+        return validate_price(match.group().replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _offer_prices(value: object) -> list[object]:
+    prices: list[object] = []
+    if isinstance(value, list):
+        for item in value:
+            prices.extend(_offer_prices(item))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() in {"price", "lowprice"}:
+                prices.append(item)
+            elif isinstance(item, (dict, list)):
+                prices.extend(_offer_prices(item))
+    return prices
+
+
+def _product_schema_prices(value: object) -> list[object]:
+    products: list[object] = []
+    if isinstance(value, list):
+        for item in value:
+            products.extend(_product_schema_prices(item))
+    elif isinstance(value, dict):
+        schema_type = value.get("@type", [])
+        if isinstance(schema_type, str):
+            schema_type = [schema_type]
+        if isinstance(schema_type, list) and any(
+            isinstance(item, str) and item.lower() == "product" for item in schema_type
+        ):
+            products.extend(_offer_prices(value.get("offers", [])))
+        for item in value.values():
+            if isinstance(item, (dict, list)):
+                products.extend(_product_schema_prices(item))
+    return products
+
+
+class SafeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self, req: Request, fp, code: int, msg: str, headers, newurl: str
+    ) -> Request | None:
+        validate_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_product_price(value: object) -> float:
+    url = validate_public_url(validate_url(value))
+    page_request = Request(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": "PairPrice/1.0 (+local shoe price tracker)",
+        },
+    )
+    opener = build_opener(SafeRedirectHandler)
+    try:
+        with opener.open(page_request, timeout=PRODUCT_FETCH_TIMEOUT) as response:
+            validate_public_url(response.geturl())
+            page = response.read(MAX_PRODUCT_PAGE_SIZE + 1)
+    except (HTTPError, HTTPException, URLError, OSError, ValueError) as exc:
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError("Could not read the product page. Check the link and try again.") from exc
+    if len(page) > MAX_PRODUCT_PAGE_SIZE:
+        raise ValueError("The product page is too large to check.")
+
+    parser = ProductPageParser()
+    parser.feed(page.decode("utf-8", errors="replace"))
+    for candidate in [*parser.meta_prices, *parser.item_prices]:
+        price = _validated_page_price(candidate)
+        if price is not None:
+            return price
+    for script in parser.schema_scripts:
+        try:
+            schema = json.loads(script)
+        except json.JSONDecodeError:
+            continue
+        for candidate in _product_schema_prices(schema):
+            price = _validated_page_price(candidate)
+            if price is not None:
+                return price
+    raise ValueError("No product price was found. Enter the price manually for this website.")
+
+
 @app.get("/")
 def index():
     response = make_response(PAGE)
@@ -378,6 +564,15 @@ def list_shoes():
         return jsonify([serialize_shoe(connection, row) for row in rows])
 
 
+@app.post("/api/price")
+def preview_price():
+    try:
+        data = read_json()
+        return jsonify({"price": fetch_product_price(data.get("url"))})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 @app.post("/api/shoes")
 def add_shoe():
     try:
@@ -386,12 +581,16 @@ def add_shoe():
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
             raise ValueError("Shoe name must be between 1 and 100 characters.")
         url = validate_url(data.get("url"))
-        price = validate_price(data.get("price"))
         target_value = data.get("target_price")
         target_price = None if target_value is None else validate_price(target_value, "Target price")
         priority = data.get("priority", "Medium")
         if not isinstance(priority, str) or priority not in {"Low", "Medium", "High"}:
             raise ValueError("Priority must be Low, Medium, or High.")
+        price = (
+            fetch_product_price(url)
+            if data.get("price") in (None, "")
+            else validate_price(data.get("price"))
+        )
         with connect() as connection:
             cursor = connection.execute(
                 "INSERT INTO shoes (name, url, price, target_price, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -435,6 +634,33 @@ def update_shoe_price(shoe_id: str):
     except sqlite3.Error:
         app.logger.exception("Unable to update shoe price.")
         return jsonify({"error": "The price could not be updated. Please try again."}), 500
+
+
+@app.post("/api/shoes/<shoe_id>/refresh")
+def refresh_shoe_price(shoe_id: str):
+    try:
+        parsed_id = int(shoe_id)
+        if parsed_id < 1:
+            raise ValueError
+        with connect() as connection:
+            row = connection.execute("SELECT * FROM shoes WHERE id = ?", (parsed_id,)).fetchone()
+            if row is None:
+                return jsonify({"error": "That pair is no longer on your list."}), 404
+            price = fetch_product_price(row["url"])
+            connection.execute("UPDATE shoes SET price = ? WHERE id = ?", (price, parsed_id))
+            connection.execute(
+                "INSERT INTO price_history (shoe_id, price, recorded_at) VALUES (?, ?, ?)",
+                (parsed_id, price, now_utc()),
+            )
+            updated = connection.execute("SELECT * FROM shoes WHERE id = ?", (parsed_id,)).fetchone()
+            return jsonify(serialize_shoe(connection, updated))
+    except ValueError as exc:
+        if str(exc):
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"error": "Enter a valid pair ID."}), 400
+    except sqlite3.Error:
+        app.logger.exception("Unable to refresh shoe price.")
+        return jsonify({"error": "The price could not be refreshed. Please try again."}), 500
 
 
 @app.delete("/api/shoes/<shoe_id>")
