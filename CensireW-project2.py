@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, make_response, request
+from flask import Flask, jsonify, make_response, request  # type: ignore[reportMissingImports]
 from werkzeug.exceptions import RequestEntityTooLarge
 
 
