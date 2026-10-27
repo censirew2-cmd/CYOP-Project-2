@@ -54,10 +54,10 @@ PAGE = r"""<!doctype html>
     .summary { min-width: 180px; padding: 18px 22px; border: 1px solid var(--line); border-radius: 16px; background: var(--card); }
     .summary strong { display: block; font-size: 28px; letter-spacing: -1px; }
     .summary span { color: var(--muted); font-size: 12px; }
-    .add-panel { display: grid; grid-template-columns: 1.15fr 1.5fr .8fr .8fr auto; gap: 12px; align-items: end; padding: 20px; border-radius: 19px; background: #e9eee7; }
+    .add-panel { display: grid; grid-template-columns: 1.15fr 1.5fr .8fr .8fr .85fr auto; gap: 12px; align-items: end; padding: 20px; border-radius: 19px; background: #e9eee7; }
     .field label { display: block; margin: 0 0 7px; color: #51564f; font-size: 11px; font-weight: 750; }
-    .field input, .search { width: 100%; height: 44px; padding: 0 12px; border: 1px solid #d6dbd3; border-radius: 10px; outline: none; background: white; color: var(--ink); }
-    .field input:focus, .search:focus { border-color: var(--green); box-shadow: 0 0 0 3px #2f68481a; }
+    .field input, .field select, .search { width: 100%; height: 44px; padding: 0 12px; border: 1px solid #d6dbd3; border-radius: 10px; outline: none; background: white; color: var(--ink); }
+    .field input:focus, .field select:focus, .search:focus { border-color: var(--green); box-shadow: 0 0 0 3px #2f68481a; }
     .primary { height: 44px; padding: 0 18px; border: 0; border-radius: 10px; background: var(--green); color: white; font-weight: 750; white-space: nowrap; }
     .primary:hover { background: var(--green-dark); }
     .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin: 35px 0 17px; }
@@ -69,6 +69,11 @@ PAGE = r"""<!doctype html>
     .shoe-symbol { align-self: flex-end; color: #82927d; font-size: 45px; line-height: 1; }
     .badge { display: inline-flex; align-self: flex-start; align-items: center; gap: 6px; padding: 6px 9px; border-radius: 999px; background: white; color: var(--green); font-size: 10px; font-weight: 800; }
     .badge.target { background: var(--lime); color: #38531e; }
+    .shoe-badges { display: flex; flex-wrap: wrap; gap: 7px; }
+    .badge.priority { background: #fff; color: #555; text-transform: capitalize; }
+    .badge.priority.high { background: #f9ded8; color: #9c3d2e; }
+    .badge.priority.medium { background: #f7ebca; color: #765914; }
+    .badge.priority.low { background: #dcece0; color: #376046; }
     .shoe-body { padding: 17px 18px 15px; }
     .shoe-name { overflow: hidden; margin: 0; font-size: 17px; font-weight: 780; letter-spacing: -.45px; text-overflow: ellipsis; white-space: nowrap; }
     .store-link { display: inline-block; max-width: 100%; overflow: hidden; margin-top: 5px; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
@@ -122,6 +127,7 @@ PAGE = r"""<!doctype html>
       <div class="field url"><label for="url">PRODUCT LINK</label><input id="url" name="url" type="url" placeholder="https://store.com/product" maxlength="2000" required></div>
       <div class="field"><label for="price">CURRENT PRICE ($)</label><input id="price" name="price" type="number" min="0.01" max="1000000" step="0.01" placeholder="120.00" required></div>
       <div class="field"><label for="target">TARGET ($) · OPTIONAL</label><input id="target" name="target" type="number" min="0.01" max="1000000" step="0.01" placeholder="90.00"></div>
+      <div class="field"><label for="priority">PRIORITY</label><select id="priority" name="priority"><option value="Low">Low</option><option value="Medium" selected>Medium</option><option value="High">High</option></select></div>
       <button class="primary" type="submit">＋ Add pair</button>
     </form>
     <section>
@@ -179,7 +185,7 @@ PAGE = r"""<!doctype html>
           ? `<span class="badge target">✓ Target reached</span>`
           : `<span class="badge">● Tracking</span>`;
         return `<article class="shoe-card">
-          <div class="shoe-top">${badge}<span class="shoe-symbol" aria-hidden="true">⌁</span></div>
+          <div class="shoe-top"><div class="shoe-badges">${badge}<span class="badge priority ${escapeHtml(shoe.priority.toLowerCase())}">${escapeHtml(shoe.priority)} priority</span></div><span class="shoe-symbol" aria-hidden="true">⌁</span></div>
           <div class="shoe-body">
             <h3 class="shoe-name" title="${escapeHtml(shoe.name)}">${escapeHtml(shoe.name)}</h3>
             <a class="store-link" href="${escapeHtml(shoe.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(new URL(shoe.url).hostname)}</a>
@@ -213,7 +219,8 @@ PAGE = r"""<!doctype html>
             name: values.get("name"),
             url: values.get("url"),
             price: Number(values.get("price")),
-            target_price: target ? Number(target) : null
+            target_price: target ? Number(target) : null,
+            priority: values.get("priority")
           })
         });
         form.reset();
@@ -278,6 +285,7 @@ def initialize_database() -> None:
                 url TEXT NOT NULL,
                 price REAL NOT NULL,
                 target_price REAL,
+                priority TEXT NOT NULL DEFAULT 'Medium' CHECK(priority IN ('Low', 'Medium', 'High')),
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS price_history (
@@ -288,6 +296,13 @@ def initialize_database() -> None:
             );
             """
         )
+        shoe_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(shoes)").fetchall()
+        }
+        if "priority" not in shoe_columns:
+            connection.execute(
+                "ALTER TABLE shoes ADD COLUMN priority TEXT NOT NULL DEFAULT 'Medium'"
+            )
 
 
 def now_utc() -> str:
@@ -305,6 +320,7 @@ def serialize_shoe(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "url": row["url"],
         "price": row["price"],
         "target_price": row["target_price"],
+        "priority": row["priority"],
         "history": [dict(item) for item in history],
     }
 
@@ -389,10 +405,13 @@ class ShoeTrackerHandler(BaseHTTPRequestHandler):
             price = self.validate_price(data.get("price"))
             target_value = data.get("target_price")
             target_price = None if target_value is None else self.validate_price(target_value, "Target price")
+            priority = data.get("priority", "Medium")
+            if not isinstance(priority, str) or priority not in {"Low", "Medium", "High"}:
+                raise ValueError("Priority must be Low, Medium, or High.")
             with connect() as connection:
                 cursor = connection.execute(
-                    "INSERT INTO shoes (name, url, price, target_price, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (name.strip(), url, price, target_price, now_utc()),
+                    "INSERT INTO shoes (name, url, price, target_price, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (name.strip(), url, price, target_price, priority, now_utc()),
                 )
                 shoe_id = cursor.lastrowid
                 connection.execute(
