@@ -7,15 +7,19 @@ import math
 import os
 import sqlite3
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+from flask import Flask, jsonify, make_response, request
+from werkzeug.exceptions import RequestEntityTooLarge
 
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PAIR_PRICE_PORT", "8765"))
 DATABASE = Path(__file__).with_name("shoe_tracker.db")
 MAX_REQUEST_SIZE = 16_384
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_SIZE
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -325,167 +329,138 @@ def serialize_shoe(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
     }
 
 
-class ShoeTrackerHandler(BaseHTTPRequestHandler):
-    server_version = "PairPrice/1.0"
+def read_json() -> dict:
+    if request.content_length is None or request.content_length < 1:
+        raise ValueError("A valid JSON request body is required.")
+    if request.content_length > MAX_REQUEST_SIZE:
+        raise ValueError("The request body is empty or too large.")
+    try:
+        data = json.loads(request.get_data(cache=False))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("The request body must be valid JSON.") from exc
+    if not isinstance(data, dict):
+        raise ValueError("The request body must be a JSON object.")
+    return data
 
-    def send_json(self, status: int, payload: object) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
 
-    def read_json(self) -> dict:
-        length_text = self.headers.get("Content-Length", "")
-        try:
-            length = int(length_text)
-        except ValueError as exc:
-            raise ValueError("A valid JSON request body is required.") from exc
-        if length < 1 or length > MAX_REQUEST_SIZE:
-            raise ValueError("The request body is empty or too large.")
-        try:
-            data = json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ValueError("The request body must be valid JSON.") from exc
-        if not isinstance(data, dict):
-            raise ValueError("The request body must be a JSON object.")
-        return data
+def validate_price(value: object, label: str = "Price") -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a number greater than $0.")
+    try:
+        price = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a number greater than $0.") from exc
+    if not math.isfinite(price) or price <= 0 or price > 1_000_000:
+        raise ValueError(f"{label} must be between $0.01 and $1,000,000.")
+    return round(price, 2)
 
-    @staticmethod
-    def validate_price(value: object, label: str = "Price") -> float:
-        if isinstance(value, bool):
-            raise ValueError(f"{label} must be a number greater than $0.")
-        try:
-            price = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{label} must be a number greater than $0.") from exc
-        if not math.isfinite(price) or price <= 0 or price > 1_000_000:
-            raise ValueError(f"{label} must be between $0.01 and $1,000,000.")
-        return round(price, 2)
 
-    @staticmethod
-    def validate_url(value: object) -> str:
-        if not isinstance(value, str) or len(value) > 2000:
-            raise ValueError("Enter a valid product link.")
-        parsed = urlparse(value.strip())
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("Product link must start with http:// or https://.")
-        return value.strip()
+def validate_url(value: object) -> str:
+    if not isinstance(value, str) or len(value) > 2000:
+        raise ValueError("Enter a valid product link.")
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Product link must start with http:// or https://.")
+    return value.strip()
 
-    def do_GET(self) -> None:
-        path = urlparse(self.path).path
-        if path == "/":
-            body = PAGE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if path != "/api/shoes":
-            self.send_json(404, {"error": "Not found."})
-            return
+
+@app.get("/")
+def index():
+    response = make_response(PAGE)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@app.get("/api/shoes")
+def list_shoes():
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM shoes ORDER BY id DESC").fetchall()
+        return jsonify([serialize_shoe(connection, row) for row in rows])
+
+
+@app.post("/api/shoes")
+def add_shoe():
+    try:
+        data = read_json()
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
+            raise ValueError("Shoe name must be between 1 and 100 characters.")
+        url = validate_url(data.get("url"))
+        price = validate_price(data.get("price"))
+        target_value = data.get("target_price")
+        target_price = None if target_value is None else validate_price(target_value, "Target price")
+        priority = data.get("priority", "Medium")
+        if not isinstance(priority, str) or priority not in {"Low", "Medium", "High"}:
+            raise ValueError("Priority must be Low, Medium, or High.")
         with connect() as connection:
-            rows = connection.execute("SELECT * FROM shoes ORDER BY id DESC").fetchall()
-            self.send_json(200, [serialize_shoe(connection, row) for row in rows])
+            cursor = connection.execute(
+                "INSERT INTO shoes (name, url, price, target_price, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (name.strip(), url, price, target_price, priority, now_utc()),
+            )
+            shoe_id = cursor.lastrowid
+            connection.execute(
+                "INSERT INTO price_history (shoe_id, price, recorded_at) VALUES (?, ?, ?)",
+                (shoe_id, price, now_utc()),
+            )
+            row = connection.execute("SELECT * FROM shoes WHERE id = ?", (shoe_id,)).fetchone()
+            return jsonify(serialize_shoe(connection, row)), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except sqlite3.Error:
+        app.logger.exception("Unable to save shoe.")
+        return jsonify({"error": "The shoe could not be saved. Please try again."}), 500
 
-    def do_POST(self) -> None:
-        if urlparse(self.path).path != "/api/shoes":
-            self.send_json(404, {"error": "Not found."})
-            return
-        try:
-            data = self.read_json()
-            name = data.get("name")
-            if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
-                raise ValueError("Shoe name must be between 1 and 100 characters.")
-            url = self.validate_url(data.get("url"))
-            price = self.validate_price(data.get("price"))
-            target_value = data.get("target_price")
-            target_price = None if target_value is None else self.validate_price(target_value, "Target price")
-            priority = data.get("priority", "Medium")
-            if not isinstance(priority, str) or priority not in {"Low", "Medium", "High"}:
-                raise ValueError("Priority must be Low, Medium, or High.")
-            with connect() as connection:
-                cursor = connection.execute(
-                    "INSERT INTO shoes (name, url, price, target_price, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (name.strip(), url, price, target_price, priority, now_utc()),
-                )
-                shoe_id = cursor.lastrowid
-                connection.execute(
-                    "INSERT INTO price_history (shoe_id, price, recorded_at) VALUES (?, ?, ?)",
-                    (shoe_id, price, now_utc()),
-                )
-                row = connection.execute("SELECT * FROM shoes WHERE id = ?", (shoe_id,)).fetchone()
-                self.send_json(201, serialize_shoe(connection, row))
-        except ValueError as exc:
-            self.send_json(400, {"error": str(exc)})
-        except sqlite3.Error:
-            self.send_json(500, {"error": "The shoe could not be saved. Please try again."})
 
-    def do_PATCH(self) -> None:
-        parts = urlparse(self.path).path.strip("/").split("/")
-        if len(parts) != 3 or parts[:2] != ["api", "shoes"]:
-            self.send_json(404, {"error": "Not found."})
-            return
-        try:
-            shoe_id = int(parts[2])
-            if shoe_id < 1:
-                raise ValueError
-            data = self.read_json()
-            price = self.validate_price(data.get("price"))
-            with connect() as connection:
-                existing = connection.execute("SELECT id FROM shoes WHERE id = ?", (shoe_id,)).fetchone()
-                if existing is None:
-                    self.send_json(404, {"error": "That pair is no longer on your list."})
-                    return
-                connection.execute("UPDATE shoes SET price = ? WHERE id = ?", (price, shoe_id))
-                connection.execute(
-                    "INSERT INTO price_history (shoe_id, price, recorded_at) VALUES (?, ?, ?)",
-                    (shoe_id, price, now_utc()),
-                )
-                row = connection.execute("SELECT * FROM shoes WHERE id = ?", (shoe_id,)).fetchone()
-                self.send_json(200, serialize_shoe(connection, row))
-        except ValueError:
-            self.send_json(400, {"error": "Enter a valid pair ID and price."})
-        except sqlite3.Error:
-            self.send_json(500, {"error": "The price could not be updated. Please try again."})
-
-    def do_DELETE(self) -> None:
-        parts = urlparse(self.path).path.strip("/").split("/")
-        if len(parts) != 3 or parts[:2] != ["api", "shoes"]:
-            self.send_json(404, {"error": "Not found."})
-            return
-        try:
-            shoe_id = int(parts[2])
-            if shoe_id < 1:
-                raise ValueError
-        except ValueError:
-            self.send_json(400, {"error": "Enter a valid pair ID."})
-            return
+@app.patch("/api/shoes/<shoe_id>")
+def update_shoe_price(shoe_id: str):
+    try:
+        parsed_id = int(shoe_id)
+        if parsed_id < 1:
+            raise ValueError
+        data = read_json()
+        price = validate_price(data.get("price"))
         with connect() as connection:
-            cursor = connection.execute("DELETE FROM shoes WHERE id = ?", (shoe_id,))
-            if cursor.rowcount == 0:
-                self.send_json(404, {"error": "That pair is no longer on your list."})
-                return
-        self.send_json(200, {"ok": True})
+            existing = connection.execute("SELECT id FROM shoes WHERE id = ?", (parsed_id,)).fetchone()
+            if existing is None:
+                return jsonify({"error": "That pair is no longer on your list."}), 404
+            connection.execute("UPDATE shoes SET price = ? WHERE id = ?", (price, parsed_id))
+            connection.execute(
+                "INSERT INTO price_history (shoe_id, price, recorded_at) VALUES (?, ?, ?)",
+                (parsed_id, price, now_utc()),
+            )
+            row = connection.execute("SELECT * FROM shoes WHERE id = ?", (parsed_id,)).fetchone()
+            return jsonify(serialize_shoe(connection, row))
+    except ValueError:
+        return jsonify({"error": "Enter a valid pair ID and price."}), 400
+    except sqlite3.Error:
+        app.logger.exception("Unable to update shoe price.")
+        return jsonify({"error": "The price could not be updated. Please try again."}), 500
 
-    def log_message(self, format: str, *args: object) -> None:
-        print(f"{self.address_string()} - {format % args}")
+
+@app.delete("/api/shoes/<shoe_id>")
+def delete_shoe(shoe_id: str):
+    try:
+        parsed_id = int(shoe_id)
+        if parsed_id < 1:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "Enter a valid pair ID."}), 400
+    with connect() as connection:
+        cursor = connection.execute("DELETE FROM shoes WHERE id = ?", (parsed_id,))
+        if cursor.rowcount == 0:
+            return jsonify({"error": "That pair is no longer on your list."}), 404
+    return jsonify({"ok": True})
+
+
+@app.errorhandler(413)
+def request_too_large(error: RequestEntityTooLarge):
+    return jsonify({"error": "The request body is empty or too large."}), error.code
 
 
 def main() -> None:
     initialize_database()
-    server = ThreadingHTTPServer((HOST, PORT), ShoeTrackerHandler)
     print(f"Pair Price is running at http://{HOST}:{PORT}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down Pair Price.")
-    finally:
-        server.server_close()
+    app.run(host=HOST, port=PORT, debug=False)
 
 
 if __name__ == "__main__":
