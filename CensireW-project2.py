@@ -67,7 +67,7 @@ PAGE = r"""<!doctype html>
     .summary { min-width: 180px; padding: 18px 22px; border: 1px solid var(--line); border-radius: 16px; background: var(--card); }
     .summary strong { display: block; font-size: 28px; letter-spacing: -1px; }
     .summary span { color: var(--muted); font-size: 12px; }
-    .add-panel { display: grid; grid-template-columns: 1.15fr 1.5fr .8fr .8fr .85fr auto; gap: 12px; align-items: end; padding: 20px; border-radius: 19px; background: #e9eee7; }
+    .add-panel { display: grid; grid-template-columns: 1.1fr 1.45fr .65fr .8fr .8fr .8fr auto; gap: 12px; align-items: end; padding: 20px; border-radius: 19px; background: #e9eee7; }
     .field label { display: block; margin: 0 0 7px; color: #51564f; font-size: 11px; font-weight: 750; }
     .field input, .field select, .search { width: 100%; height: 44px; padding: 0 12px; border: 1px solid #d6dbd3; border-radius: 10px; outline: none; background: white; color: var(--ink); }
     .field input:focus, .field select:focus, .search:focus { border-color: var(--green); box-shadow: 0 0 0 3px #2f68481a; }
@@ -89,6 +89,7 @@ PAGE = r"""<!doctype html>
     .badge.priority.low { background: #dcece0; color: #376046; }
     .shoe-body { padding: 17px 18px 15px; }
     .shoe-name { overflow: hidden; margin: 0; font-size: 17px; font-weight: 780; letter-spacing: -.45px; text-overflow: ellipsis; white-space: nowrap; }
+    .shoe-size { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
     .store-link { display: inline-block; max-width: 100%; overflow: hidden; margin-top: 5px; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
     .price-row { display: flex; align-items: end; justify-content: space-between; gap: 8px; margin: 18px 0 14px; }
     .price { font-size: 28px; font-weight: 800; letter-spacing: -1px; }
@@ -139,6 +140,7 @@ PAGE = r"""<!doctype html>
     <form class="add-panel" id="add-form">
       <div class="field name"><label for="name">SHOE NAME</label><input id="name" name="name" placeholder="e.g. Air Max 90" maxlength="100" required></div>
       <div class="field url"><label for="url">PRODUCT LINK</label><input id="url" name="url" type="url" placeholder="https://store.com/product" maxlength="2000" required></div>
+      <div class="field"><label for="size">SHOE SIZE</label><input id="size" name="size" placeholder="e.g. US 10" maxlength="20"></div>
       <div class="field"><label for="price">CURRENT PRICE ($) · OPTIONAL</label><input id="price" name="price" type="number" min="0.01" max="1000000" step="0.01" placeholder="Auto-pull from link"><button class="small-btn fetch-price" id="fetch-price" type="button">Pull price from link</button></div>
       <div class="field"><label for="target">TARGET ($) · OPTIONAL</label><input id="target" name="target" type="number" min="0.01" max="1000000" step="0.01" placeholder="90.00"></div>
       <div class="field"><label for="priority">PRIORITY</label><select id="priority" name="priority"><option value="Low">Low</option><option value="Medium" selected>Medium</option><option value="High">High</option></select></div>
@@ -203,6 +205,7 @@ PAGE = r"""<!doctype html>
           <div class="shoe-top"><div class="shoe-badges">${badge}<span class="badge priority ${escapeHtml(shoe.priority.toLowerCase())}">${escapeHtml(shoe.priority)} priority</span></div><span class="shoe-symbol" aria-hidden="true">⌁</span></div>
           <div class="shoe-body">
             <h3 class="shoe-name" title="${escapeHtml(shoe.name)}">${escapeHtml(shoe.name)}</h3>
+            ${shoe.size ? `<p class="shoe-size">Size ${escapeHtml(shoe.size)}</p>` : ""}
             <a class="store-link" href="${escapeHtml(shoe.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(new URL(shoe.url).hostname)}</a>
             <div class="price-row"><div><span class="price-caption">CURRENT PRICE</span><strong class="price">${money(shoe.price)}</strong></div>
               <div class="target-price">${shoe.target_price === null ? "No target set" : "TARGET"}${shoe.target_price === null ? "" : `<strong>${money(shoe.target_price)}</strong>`}</div></div>
@@ -255,6 +258,7 @@ PAGE = r"""<!doctype html>
           body: JSON.stringify({
             name: values.get("name"),
             url: values.get("url"),
+            size: values.get("size"),
             ...(price ? { price: Number(price) } : {}),
             target_price: target ? Number(target) : null,
             priority: values.get("priority")
@@ -333,6 +337,7 @@ def initialize_database() -> None:
                 url TEXT NOT NULL,
                 price REAL NOT NULL,
                 target_price REAL,
+                size TEXT,
                 priority TEXT NOT NULL DEFAULT 'Medium' CHECK(priority IN ('Low', 'Medium', 'High')),
                 created_at TEXT NOT NULL
             );
@@ -351,6 +356,8 @@ def initialize_database() -> None:
             connection.execute(
                 "ALTER TABLE shoes ADD COLUMN priority TEXT NOT NULL DEFAULT 'Medium'"
             )
+        if "size" not in shoe_columns:
+            connection.execute("ALTER TABLE shoes ADD COLUMN size TEXT")
 
 
 def now_utc() -> str:
@@ -368,6 +375,7 @@ def serialize_shoe(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "url": row["url"],
         "price": row["price"],
         "target_price": row["target_price"],
+        "size": row["size"],
         "priority": row["priority"],
         "history": [dict(item) for item in history],
     }
@@ -583,6 +591,12 @@ def add_shoe():
         url = validate_url(data.get("url"))
         target_value = data.get("target_price")
         target_price = None if target_value is None else validate_price(target_value, "Target price")
+        size_value = data.get("size")
+        if size_value is not None and (
+            not isinstance(size_value, str) or len(size_value.strip()) > 20
+        ):
+            raise ValueError("Shoe size must be 20 characters or fewer.")
+        size = size_value.strip() or None if isinstance(size_value, str) else None
         priority = data.get("priority", "Medium")
         if not isinstance(priority, str) or priority not in {"Low", "Medium", "High"}:
             raise ValueError("Priority must be Low, Medium, or High.")
@@ -593,8 +607,8 @@ def add_shoe():
         )
         with connect() as connection:
             cursor = connection.execute(
-                "INSERT INTO shoes (name, url, price, target_price, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (name.strip(), url, price, target_price, priority, now_utc()),
+                "INSERT INTO shoes (name, url, price, target_price, size, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name.strip(), url, price, target_price, size, priority, now_utc()),
             )
             shoe_id = cursor.lastrowid
             connection.execute(
