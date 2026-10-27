@@ -1,0 +1,38 @@
+# The course walkthrough's workflow (GitHub_Workflow_Walkthrough.pdf), corrected.
+# The minimum for Project 2's pipeline: Pylint and Bandit on every push.
+# Save it as .github/workflows/quality.yml in your repository (in VS Code, or on
+# GitHub: Add file > Create new file), push, and open the repository's Actions tab.
+# It needs the pyproject.toml shipped next to it: save that in your project folder too.
+name: quality
+
+on:
+  push:
+    branches: ['**']    # every branch: the PDF has main only, and you work on branches
+                        # (no paths filter either, so every push checks every file)
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04   # ubuntu-latest moves to Ubuntu 26 between 2026-10-19 and 11-19
+    steps:
+      # The PDF's checkout@v4 and setup-python@v5 still run, but GitHub forces them onto
+      # Node 24 and flags every run with a "Node.js 20 is deprecated" warning. v7 is current.
+      # A tag like v7 is easy to read but can be moved. The hardening step is to pin
+      # each action to its full commit SHA, as the full quality.yml does.
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run Pylint
+        run: pylint $(git ls-files "*.py")    # every Python file in the repo, not one
+      # Bandit reads its settings from that pyproject.toml: skip .venv, and skip B101
+      # (assert) in test files only, because pytest checks with assert. In app code B101
+      # stays a finding: python -O strips every assert.
+      - name: Run Bandit
+        if: ${{ !cancelled() }}               # runs even when Pylint has failed
+        run: bandit -c pyproject.toml -r .
