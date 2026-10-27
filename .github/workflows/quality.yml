@@ -36,3 +36,10 @@ jobs:
       - name: Run Bandit
         if: ${{ !cancelled() }}               # runs even when Pylint has failed
         run: bandit -c pyproject.toml -r .
+      - name: Upload Pylint report
+        if: ${{ !cancelled() }}               # runs even when Pylint has failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: pylint-report
+      - name: Test the build of the project
+        run: npm run build
